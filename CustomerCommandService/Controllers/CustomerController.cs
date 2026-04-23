@@ -1,10 +1,9 @@
-﻿using CustomerCommandService.Models;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
-using CustomerCommandService.Messaging;
+﻿using System.Text;
+using System.Text.Json;
 using CustomerCommandService.Data;
+using CustomerCommandService.Models;
 using EventStore.Client;
-
+using Microsoft.AspNetCore.Mvc;
 
 namespace CustomerCommandService.Controllers;
 
@@ -13,19 +12,13 @@ namespace CustomerCommandService.Controllers;
 public class CustomerController : ControllerBase
 {
     private readonly IEventStoreWriter _eventStoreWriter;
-    private readonly RabbitMqPublisher _publisher;
-    private readonly AppDbContext _db;
     private readonly EventStoreClient _eventStoreClient;
     
     public CustomerController(
         IEventStoreWriter eventStoreWriter,
-        RabbitMqPublisher publisher,
-        AppDbContext db,
         EventStoreClient eventStoreClient)
     {
         _eventStoreWriter = eventStoreWriter;
-        _publisher = publisher;
-        _db = db;
         _eventStoreClient = eventStoreClient;
     }
 
@@ -34,12 +27,12 @@ public class CustomerController : ControllerBase
     {
         try
         {
-            customer.Id = Guid.NewGuid();
-            customer.IsDeleted = false;
-            customer.UpdatedAtUtc = DateTime.UtcNow;
+            if (string.IsNullOrWhiteSpace(customer.Name))
+            {
+                return BadRequest("Customer name is required.");
+            }
 
-            _db.Customers.Add(customer);
-            await _db.SaveChangesAsync(cancellationToken);
+            customer.Id = Guid.NewGuid();
 
             var evt = new CustomerCreatedEvent
             {
@@ -50,7 +43,7 @@ public class CustomerController : ControllerBase
                 EventType = "CustomerCreatedV1",
                 Data = new CustomerEventData
                 {
-                    Name = customer.Name ?? string.Empty,
+                    Name = customer.Name,
                     Phone = customer.Phone ?? string.Empty,
                     Address = customer.Address ?? string.Empty,
                     City = customer.City ?? string.Empty,
@@ -60,14 +53,32 @@ public class CustomerController : ControllerBase
             };
 
             await _eventStoreWriter.AppendCustomerCreatedAsync(evt, cancellationToken);
-            _publisher.Publish(evt);
 
             return Accepted(new
             {
-                message = "Event stored and published",
+                message = "CustomerCreated event stored",
                 eventId = evt.EventId,
                 customerId = evt.AggregateId
             });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error: {ex.Message}");
+        }
+    }
+
+    [HttpGet("{id:guid}")]
+    public async Task<IActionResult> GetCustomer(Guid id, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var aggregate = await LoadCustomerStateAsync(id, cancellationToken);
+            if (aggregate is null)
+            {
+                return NotFound($"Customer {id} not found.");
+            }
+
+            return Ok(aggregate.Customer);
         }
         catch (Exception ex)
         {
@@ -80,29 +91,22 @@ public class CustomerController : ControllerBase
     {
         try
         {
-            var existing = await _db.Customers.FindAsync([id], cancellationToken);
-            if (existing is null)
+            var aggregate = await LoadCustomerStateAsync(id, cancellationToken);
+            if (aggregate is null)
             {
-                var hasHistory = await HasHistoryInEventStoreAsync(id, cancellationToken);
-                if (!hasHistory)
-                {
-                    return NotFound($"Customer {id} not found.");
-                }
-
-                existing = new Customer { Id = id };
-                _db.Customers.Add(existing);
+                return NotFound($"Customer {id} not found.");
             }
 
-            existing.Name = customer.Name ?? string.Empty;
-            existing.Phone = customer.Phone ?? string.Empty;
-            existing.Address = customer.Address ?? string.Empty;
-            existing.City = customer.City ?? string.Empty;
-            existing.Country = customer.Country ?? string.Empty;
-            existing.Email = customer.Email ?? string.Empty;
-            existing.IsDeleted = false;
-            existing.UpdatedAtUtc = DateTime.UtcNow;
+            var existing = aggregate.Customer;
+            if (existing.IsDeleted)
+            {
+                return Conflict($"Customer {id} is deleted and cannot be updated.");
+            }
 
-            await _db.SaveChangesAsync(cancellationToken);
+            if (string.IsNullOrWhiteSpace(customer.Name))
+            {
+                return BadRequest("Customer name is required.");
+            }
 
             var evt = new CustomerUpdatedEvent
             {
@@ -113,24 +117,27 @@ public class CustomerController : ControllerBase
                 EventType = "CustomerUpdatedV1",
                 Data = new CustomerEventData
                 {
-                    Name = existing.Name,
-                    Phone = existing.Phone,
-                    Address = existing.Address,
-                    City = existing.City,
-                    Country = existing.Country,
-                    Email = existing.Email
+                    Name = customer.Name,
+                    Phone = customer.Phone ?? string.Empty,
+                    Address = customer.Address ?? string.Empty,
+                    City = customer.City ?? string.Empty,
+                    Country = customer.Country ?? string.Empty,
+                    Email = customer.Email ?? string.Empty
                 }
             };
 
-            await _eventStoreWriter.AppendCustomerUpdatedAsync(evt, cancellationToken);
-            _publisher.Publish(evt);
+            await _eventStoreWriter.AppendCustomerUpdatedAsync(evt, aggregate.LastRevision, cancellationToken);
 
             return Accepted(new
             {
-                message = "Update event stored and published",
+                message = "CustomerUpdated event stored",
                 eventId = evt.EventId,
                 customerId = evt.AggregateId
             });
+        }
+        catch (WrongExpectedVersionException)
+        {
+            return Conflict("Customer has changed by another request. Please retry with latest state.");
         }
         catch (Exception ex)
         {
@@ -143,29 +150,13 @@ public class CustomerController : ControllerBase
     {
         try
         {
-            var existing = await _db.Customers.FindAsync([id], cancellationToken);
-            if (existing is null)
+            var aggregate = await LoadCustomerStateAsync(id, cancellationToken);
+            if (aggregate is null)
             {
-                var hasHistory = await HasHistoryInEventStoreAsync(id, cancellationToken);
-                if (!hasHistory)
-                {
-                    return NotFound($"Customer {id} not found.");
-                }
-
-                existing = new Customer
-                {
-                    Id = id,
-                    Name = string.Empty,
-                    Phone = string.Empty,
-                    Address = string.Empty,
-                    City = string.Empty,
-                    Country = string.Empty,
-                    Email = string.Empty,
-                    IsDeleted = false
-                };
-                _db.Customers.Add(existing);
+                return NotFound($"Customer {id} not found.");
             }
 
+            var existing = aggregate.Customer;
             if (existing.IsDeleted)
             {
                 return Accepted(new
@@ -174,10 +165,6 @@ public class CustomerController : ControllerBase
                     customerId = id
                 });
             }
-
-            existing.IsDeleted = true;
-            existing.UpdatedAtUtc = DateTime.UtcNow;
-            await _db.SaveChangesAsync(cancellationToken);
 
             var evt = new CustomerDeletedEvent
             {
@@ -188,15 +175,18 @@ public class CustomerController : ControllerBase
                 EventType = "CustomerDeletedV1"
             };
 
-            await _eventStoreWriter.AppendCustomerDeletedAsync(evt, cancellationToken);
-            _publisher.Publish(evt);
+            await _eventStoreWriter.AppendCustomerDeletedAsync(evt, aggregate.LastRevision, cancellationToken);
 
             return Accepted(new
             {
-                message = "Delete event stored and published",
+                message = "CustomerDeleted event stored",
                 eventId = evt.EventId,
                 customerId = evt.AggregateId
             });
+        }
+        catch (WrongExpectedVersionException)
+        {
+            return Conflict("Customer has changed by another request. Please retry with latest state.");
         }
         catch (Exception ex)
         {
@@ -204,42 +194,126 @@ public class CustomerController : ControllerBase
         }
     }
 
-    [HttpGet]
-    public IActionResult GetCustomers()
-    {
-        var customer = _db.Customers.Where(x => !x.IsDeleted).ToList();
-        return Ok(customer);
-    }
-
-    [HttpGet("{id:guid}")]
-    public IActionResult GetCustomer(Guid id, CancellationToken cancellationToken)
-    {
-        var customer = _db.Customers.Where(x => !x.IsDeleted && x.Id == id).ToList();
-        return Ok(customer);
-    }
-
-    private async Task<bool> HasHistoryInEventStoreAsync(Guid id, CancellationToken cancellationToken)
+    private async Task<CustomerAggregateState?> LoadCustomerStateAsync(Guid id, CancellationToken cancellationToken)
     {
         var streamName = $"customer-{id:N}";
-        var readResult = _eventStoreClient.ReadStreamAsync(
+        var firstPage = _eventStoreClient.ReadStreamAsync(
             Direction.Forwards,
             streamName,
             StreamPosition.Start,
             maxCount: 1,
             cancellationToken: cancellationToken);
 
-        var state = await readResult.ReadState;
+        var state = await firstPage.ReadState;
         if (state == ReadState.StreamNotFound)
         {
-            return false;
+            return null;
         }
 
-        await foreach (var _ in readResult)
+        var customer = new Customer { Id = id };
+        ulong? lastRevision = null;
+
+        var position = StreamPosition.Start;
+        while (true)
         {
-            return true;
+            var page = _eventStoreClient.ReadStreamAsync(
+                Direction.Forwards,
+                streamName,
+                position,
+                maxCount: 512,
+                cancellationToken: cancellationToken);
+
+            var hasAny = false;
+            await foreach (var resolvedEvent in page)
+            {
+                hasAny = true;
+                position = resolvedEvent.Event.EventNumber + 1;
+                lastRevision = resolvedEvent.Event.EventNumber.ToUInt64();
+
+                // Skip metadata and system events
+                if (resolvedEvent.Event.EventType.StartsWith("$", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var json = Encoding.UTF8.GetString(resolvedEvent.Event.Data.ToArray());
+
+                try
+                {
+                    switch (resolvedEvent.Event.EventType)
+                    {
+                        case "CustomerCreatedV1":
+                        {
+                            var evt = JsonSerializer.Deserialize<CustomerCreatedEvent>(json);
+                            if (evt?.Data is null)
+                            {
+                                continue;
+                            }
+
+                            customer.Name = evt.Data.Name;
+                            customer.Phone = evt.Data.Phone ?? string.Empty;
+                            customer.Address = evt.Data.Address ?? string.Empty;
+                            customer.City = evt.Data.City ?? string.Empty;
+                            customer.Country = evt.Data.Country ?? string.Empty;
+                            customer.Email = evt.Data.Email ?? string.Empty;
+                            customer.IsDeleted = false;
+                            customer.UpdatedAtUtc = evt.OccurredAtUtc;
+                            break;
+                        }
+                        case "CustomerUpdatedV1":
+                        {
+                            var evt = JsonSerializer.Deserialize<CustomerUpdatedEvent>(json);
+                            if (evt?.Data is null)
+                            {
+                                continue;
+                            }
+
+                            customer.Name = evt.Data.Name;
+                            customer.Phone = evt.Data.Phone ?? string.Empty;
+                            customer.Address = evt.Data.Address ?? string.Empty;
+                            customer.City = evt.Data.City ?? string.Empty;
+                            customer.Country = evt.Data.Country ?? string.Empty;
+                            customer.Email = evt.Data.Email ?? string.Empty;
+                            customer.IsDeleted = false;
+                            customer.UpdatedAtUtc = evt.OccurredAtUtc;
+                            break;
+                        }
+                        case "CustomerDeletedV1":
+                        {
+                            var evt = JsonSerializer.Deserialize<CustomerDeletedEvent>(json);
+                            if (evt is null)
+                            {
+                                continue;
+                            }
+
+                            customer.IsDeleted = true;
+                            customer.UpdatedAtUtc = evt.OccurredAtUtc;
+                            break;
+                        }
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    // Log and continue if deserialization fails
+                    Console.WriteLine($"Failed to deserialize event {resolvedEvent.Event.EventType}: {ex.Message}");
+                    continue;
+                }
+            }
+
+            if (!hasAny)
+            {
+                break;
+            }
         }
 
-        return false;
+        if (lastRevision is null)
+        {
+            return null;
+        }
+
+        return new CustomerAggregateState(customer, lastRevision.Value);
     }
+
+    private sealed record CustomerAggregateState(Customer Customer, ulong LastRevision);
 
 }
