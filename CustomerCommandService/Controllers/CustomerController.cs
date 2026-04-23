@@ -211,6 +211,13 @@ public class CustomerController : ControllerBase
         return Ok(customer);
     }
 
+    [HttpGet("{id:guid}")]
+    public IActionResult GetCustomer(Guid id, CancellationToken cancellationToken)
+    {
+        var customer = _db.Customers.Where(x => !x.IsDeleted && x.Id == id).ToList();
+        return Ok(customer);
+    }
+
     private async Task<bool> HasHistoryInEventStoreAsync(Guid id, CancellationToken cancellationToken)
     {
         var streamName = $"customer-{id:N}";
