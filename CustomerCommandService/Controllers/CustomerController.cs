@@ -4,6 +4,8 @@ using CustomerCommandService.Data;
 using CustomerCommandService.Models;
 using EventStore.Client;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System.Collections.Generic;
 
 namespace CustomerCommandService.Controllers;
 
@@ -13,13 +15,19 @@ public class CustomerController : ControllerBase
 {
     private readonly IEventStoreWriter _eventStoreWriter;
     private readonly EventStoreClient _eventStoreClient;
+    private readonly AppDbContext _db;
+    private readonly ILogger<CustomerController> _logger;
     
     public CustomerController(
         IEventStoreWriter eventStoreWriter,
-        EventStoreClient eventStoreClient)
+        EventStoreClient eventStoreClient,
+        AppDbContext db,
+        ILogger<CustomerController> logger)
     {
         _eventStoreWriter = eventStoreWriter;
         _eventStoreClient = eventStoreClient;
+        _db = db;
+        _logger = logger;
     }
 
     [HttpPost]
@@ -54,6 +62,23 @@ public class CustomerController : ControllerBase
 
             await _eventStoreWriter.AppendCustomerCreatedAsync(evt, cancellationToken);
 
+            // var commandDbSynced = await TryPersistCommandDbAsync(async () =>
+            // {
+            //     _db.Customers.Add(new Customer
+            //     {
+            //         Id = evt.AggregateId,
+            //         Name = evt.Data.Name,
+            //         Phone = evt.Data.Phone,
+            //         Address = evt.Data.Address,
+            //         City = evt.Data.City,
+            //         Country = evt.Data.Country,
+            //         Email = evt.Data.Email,
+            //         IsDeleted = false,
+            //         UpdatedAtUtc = evt.OccurredAtUtc
+            //     });
+            //     await _db.SaveChangesAsync(cancellationToken);
+            // }, "Create", evt.AggregateId);
+
             return Accepted(new
             {
                 message = "CustomerCreated event stored",
@@ -72,13 +97,35 @@ public class CustomerController : ControllerBase
     {
         try
         {
-            var aggregate = await LoadCustomerStateAsync(id, cancellationToken);
-            if (aggregate is null)
+            var customer = await _db.Customers
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == id && !x.IsDeleted, cancellationToken);
+
+            if (customer is null)
             {
                 return NotFound($"Customer {id} not found.");
             }
 
-            return Ok(aggregate.Customer);
+            return Ok(customer);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error: {ex.Message}");
+        }
+    }
+
+    [HttpGet]
+    public async Task<IActionResult> GetCustomers(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var customers = await _db.Customers
+                .AsNoTracking()
+                .Where(x => !x.IsDeleted)
+                .OrderByDescending(x => x.UpdatedAtUtc ?? DateTime.MinValue)
+                .ToListAsync(cancellationToken);
+
+            return Ok(customers);
         }
         catch (Exception ex)
         {
@@ -128,11 +175,45 @@ public class CustomerController : ControllerBase
 
             await _eventStoreWriter.AppendCustomerUpdatedAsync(evt, aggregate.LastRevision, cancellationToken);
 
+            var commandDbSynced = await TryPersistCommandDbAsync(async () =>
+            {
+                var row = await _db.Customers.FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+                if (row is null)
+                {
+                    _db.Customers.Add(new Customer
+                    {
+                        Id = evt.AggregateId,
+                        Name = evt.Data.Name,
+                        Phone = evt.Data.Phone,
+                        Address = evt.Data.Address,
+                        City = evt.Data.City,
+                        Country = evt.Data.Country,
+                        Email = evt.Data.Email,
+                        IsDeleted = false,
+                        UpdatedAtUtc = evt.OccurredAtUtc
+                    });
+                }
+                else
+                {
+                    row.Name = evt.Data.Name;
+                    row.Phone = evt.Data.Phone;
+                    row.Address = evt.Data.Address;
+                    row.City = evt.Data.City;
+                    row.Country = evt.Data.Country;
+                    row.Email = evt.Data.Email;
+                    row.IsDeleted = false;
+                    row.UpdatedAtUtc = evt.OccurredAtUtc;
+                }
+
+                await _db.SaveChangesAsync(cancellationToken);
+            }, "Update", evt.AggregateId);
+
             return Accepted(new
             {
                 message = "CustomerUpdated event stored",
                 eventId = evt.EventId,
-                customerId = evt.AggregateId
+                customerId = evt.AggregateId,
+                commandDbSynced
             });
         }
         catch (WrongExpectedVersionException)
@@ -177,11 +258,23 @@ public class CustomerController : ControllerBase
 
             await _eventStoreWriter.AppendCustomerDeletedAsync(evt, aggregate.LastRevision, cancellationToken);
 
+            var commandDbSynced = await TryPersistCommandDbAsync(async () =>
+            {
+                var row = await _db.Customers.FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+                if (row is not null)
+                {
+                    row.IsDeleted = true;
+                    row.UpdatedAtUtc = evt.OccurredAtUtc;
+                    await _db.SaveChangesAsync(cancellationToken);
+                }
+            }, "Delete", evt.AggregateId);
+
             return Accepted(new
             {
                 message = "CustomerDeleted event stored",
                 eventId = evt.EventId,
-                customerId = evt.AggregateId
+                customerId = evt.AggregateId,
+                commandDbSynced
             });
         }
         catch (WrongExpectedVersionException)
@@ -314,6 +407,136 @@ public class CustomerController : ControllerBase
         return new CustomerAggregateState(customer, lastRevision.Value);
     }
 
+    private async Task<List<Customer>> LoadAllCustomersStateAsync(CancellationToken cancellationToken)
+    {
+        var customers = new Dictionary<Guid, Customer>();
+
+        var position = Position.Start;
+        while (true)
+        {
+            var page = _eventStoreClient.ReadAllAsync(
+                Direction.Forwards,
+                position,
+                maxCount: 512,
+                cancellationToken: cancellationToken);
+
+            var hasAny = false;
+            await foreach (var resolvedEvent in page)
+            {
+                hasAny = true;
+                var originalPos = resolvedEvent.OriginalPosition.GetValueOrDefault();
+                position = new Position(originalPos.CommitPosition + 1, originalPos.PreparePosition + 1);
+
+                var streamId = resolvedEvent.Event.EventStreamId;
+                if (!streamId.StartsWith("customer-", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (resolvedEvent.Event.EventType.StartsWith("$", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var idPart = streamId.Substring("customer-".Length);
+                if (!Guid.TryParseExact(idPart, "N", out var aggregateId))
+                {
+                    continue;
+                }
+
+                if (!customers.TryGetValue(aggregateId, out var customer))
+                {
+                    customer = new Customer { Id = aggregateId };
+                    customers[aggregateId] = customer;
+                }
+
+                var json = Encoding.UTF8.GetString(resolvedEvent.Event.Data.ToArray());
+
+                try
+                {
+                    switch (resolvedEvent.Event.EventType)
+                    {
+                        case "CustomerCreatedV1":
+                        {
+                            var evt = JsonSerializer.Deserialize<CustomerCreatedEvent>(json);
+                            if (evt?.Data is null)
+                            {
+                                continue;
+                            }
+
+                            customer.Name = evt.Data.Name;
+                            customer.Phone = evt.Data.Phone ?? string.Empty;
+                            customer.Address = evt.Data.Address ?? string.Empty;
+                            customer.City = evt.Data.City ?? string.Empty;
+                            customer.Country = evt.Data.Country ?? string.Empty;
+                            customer.Email = evt.Data.Email ?? string.Empty;
+                            customer.IsDeleted = false;
+                            customer.UpdatedAtUtc = evt.OccurredAtUtc;
+                            break;
+                        }
+                        case "CustomerUpdatedV1":
+                        {
+                            var evt = JsonSerializer.Deserialize<CustomerUpdatedEvent>(json);
+                            if (evt?.Data is null)
+                            {
+                                continue;
+                            }
+
+                            customer.Name = evt.Data.Name;
+                            customer.Phone = evt.Data.Phone ?? string.Empty;
+                            customer.Address = evt.Data.Address ?? string.Empty;
+                            customer.City = evt.Data.City ?? string.Empty;
+                            customer.Country = evt.Data.Country ?? string.Empty;
+                            customer.Email = evt.Data.Email ?? string.Empty;
+                            customer.IsDeleted = false;
+                            customer.UpdatedAtUtc = evt.OccurredAtUtc;
+                            break;
+                        }
+                        case "CustomerDeletedV1":
+                        {
+                            var evt = JsonSerializer.Deserialize<CustomerDeletedEvent>(json);
+                            if (evt is null)
+                            {
+                                continue;
+                            }
+
+                            customer.IsDeleted = true;
+                            customer.UpdatedAtUtc = evt.OccurredAtUtc;
+                            break;
+                        }
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    Console.WriteLine($"Failed to deserialize event {resolvedEvent.Event.EventType}: {ex.Message}");
+                }
+            }
+
+            if (!hasAny)
+            {
+                break;
+            }
+        }
+
+        return customers.Values
+            .OrderByDescending(x => x.UpdatedAtUtc ?? DateTime.MinValue)
+            .ToList();
+    }
+
     private sealed record CustomerAggregateState(Customer Customer, ulong LastRevision);
+
+    private async Task<bool> TryPersistCommandDbAsync(Func<Task> action, string operation, Guid aggregateId)
+    {
+        try
+        {
+            await action();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Command DB sync failed for {Operation}, AggregateId={AggregateId}. Event already stored in EventStore.", operation, aggregateId);
+            return false;
+        }
+    }
 
 }
